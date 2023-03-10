@@ -4,8 +4,10 @@ import numpy as np
 import random
 import glm
 import multiprocessing
+import pickle
 
 campath = 'data/cam%d/intrinsics.xml'
+projectpath = 'data/cam%d/prj'
 boardpath = 'data/checkerboard.xml'
 videopath = 'data/%s/%s.avi'
 samplesize = 30
@@ -53,15 +55,16 @@ class CameraConfig:
 
     mtx: dict = {}
     dist: dict = {}
-    video: dict = {}
+    stepSize = 1
     cBWidth: int
     cBHeight: int
     cBSquareSize: int
-    mask: dict = {}
+    imgSize: [0, 0]
     _rvecs: dict = {}
     _tvecs: dict = {}
     _cameraposition: dict = {}
     _rotation: dict = {}
+    _pjpoints = [dict() for _ in range(4)]
 
     def __new__(cls, *args, **kwargs):
         if not hasattr(CameraConfig, "_instance"):
@@ -85,6 +88,10 @@ class CameraConfig:
             dist = np.mat(fs.getNode("DistortionCoeffs").mat())
             self.dist['cam%d' % i] = dist
             fs.release()
+        cap = cv.VideoCapture(videopath % ('cam1', 'video'))
+        if cap.isOpened():
+            ret, frame = cap.read()
+            self.imgSize[0], self.imgSize[1] = frame.shape[:2]
         print('parameters loaded')
 
     # update the 'cname' file, if no input, update all
@@ -295,61 +302,29 @@ class CameraConfig:
         mask[mask == 255] = 1
         self.mask[cname] = mask
 
-    '''
-    def voxel_pos(self, block_size):
-        data = []
+    def _project_points(self, objp, cam_idx):
+        return cv.projectPoints(objp * self.cBSquareSize, self._rvecs['cam%d' % cam_idx],
+                                self._tvecs['cam%d' % cam_idx], self.mtx['cam%d' % cam_idx],
+                                self.dist['cam%d' % cam_idx])[0]
+
+    def voxel_pos_save(self, step):
         imgp = []
-        step = 5
-        xrange = range(-15 * step, 15 * step)
-        yrange = range(-15 * step, 15 * step)
-        zrange = range(-15 * step, 15 * step)
+        [h, w] = self.imgSize
+
+        xrange = range(-50 * step, 50 * step)
+        yrange = range(-50 * step, 50 * step)
+        zrange = range(-50 * step, 50 * step)
+
+        pjcam = [dict() for _ in range(4)]
 
         objp = np.zeros((len(xrange) * len(yrange) * len(zrange), 3), np.float32)
         objp[:, :3] = np.mgrid[xrange, yrange, zrange].T.reshape(-1, 3)
         objp /= step
-
-        testrange = range(1, 5)
-
-        for i in range(1, 5):
-            imgpts, _ = cv.projectPoints(objp * self.cBSquareSize, self._rvecs['cam%d' % i], self._tvecs['cam%d' % i],
-                                         self.mtx['cam%d' % i], self.dist['cam%d' % i])
-            imgp.append(imgpts.astype(int))
-        for i in range(objp.shape[0]):
-            objpt = objp[i]
-            score = 0
-            for j in testrange:
-                imgpts2 = imgp[j - 1][i][0]
-                mask = self.mask['cam%d' % j]
-                h, w = mask.shape[:2]
-                if 0 <= imgpts2[0] < w and 0 <= imgpts2[1] < h:
-                    score += mask[imgpts2[1]][imgpts2[0]]
-            if score > 3:
-                data.append([-objpt[0]*step, -objpt[2]*step, objpt[1]*step])
-        
-        return data
-    '''
-    def project_points(self, objp, cam_idx):
-        return cv.projectPoints(objp * self.cBSquareSize, self._rvecs['cam%d' % cam_idx], self._tvecs['cam%d' % cam_idx],
-                                self.mtx['cam%d' % cam_idx], self.dist['cam%d' % cam_idx])[0]
-    
-    def voxel_pos_mp(self, block_size):
-        data = []
-        imgp = []
-        step = 5
-        xrange = range(-15 * step, 15 * step)
-        yrange = range(-15 * step, 15 * step)
-        zrange = range(-15 * step, 15 * step)
-
-        objp = np.zeros((len(xrange) * len(yrange) * len(zrange), 3), np.float32)
-        objp[:, :3] = np.mgrid[xrange, yrange, zrange].T.reshape(-1, 3)
-        objp /= step
-
-        testrange = range(1, 5)
 
         pool = multiprocessing.Pool()
         results = []
         for i in range(1, 5):
-            results.append(pool.apply_async(self.project_points, args=(objp, i)))
+            results.append(pool.apply_async(self._project_points, args=(objp, i)))
 
         for res in results:
             imgpts = res.get()
@@ -358,17 +333,30 @@ class CameraConfig:
         for i in range(objp.shape[0]):
             objpt = objp[i]
             score = 0
-            for j in testrange:
-                imgpts2 = imgp[j - 1][i][0]
-                mask = self.mask['cam%d' % j]
-                h, w = mask.shape[:2]
-                if 0 <= imgpts2[0] < w and 0 <= imgpts2[1] < h:
-                    score += mask[imgpts2[1]][imgpts2[0]]
+            imgpts2 = [[] for _ in range(4)]
+            for j in range(4):
+                imgpts2[j] = imgp[j][i][0]
+                if 0 <= imgpts2[j][0] < w and 0 <= imgpts2[j][1] < h:
+                    score += 1
             if score > 3:
-                data.append([-objpt[0]*step, -objpt[2]*step, objpt[1]*step])
+                for k in range(4):
+                    pjcam[k].setdefault(imgpts2[k], []).append(objpt * step)
 
-        return data
-    
+        self._pjpoints = pjcam
+
+        for i in range(4):
+            f = open(projectpath % (i + 1), 'wb')
+            pickle.dump(pjcam[i], f)
+            f.close()
+
+    def load_project_points(self):
+        pjcam = [dict() for _ in range(4)]
+        for i in range(4):
+            f = open(projectpath % (i + 1), 'rb')
+            pjcam[i] = pickle.load(f)
+            f.close()
+        self._pjpoints = pjcam
+
     def camera_position(self, cname=[]):
         if not cname:
             for i in range(1, 5):
@@ -382,7 +370,7 @@ class CameraConfig:
             # print(R_mat)
             # print(cam_angle)
             R_mat = R_mat.T
-            cpos = -R_mat * self._tvecs[cname] / (self.cBSquareSize/5)
+            cpos = -R_mat * self._tvecs[cname] / (self.cBSquareSize / 5)
 
             cposgl = []
             cposgl.append(cpos[0])  # x
